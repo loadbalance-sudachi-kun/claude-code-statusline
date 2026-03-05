@@ -6,7 +6,7 @@
 
 input=$(cat)
 
-# ---------- ANSI Colors (using $'...' for real escape chars) ----------
+# ---------- ANSI Colors ----------
 GREEN=$'\e[38;2;151;201;195m'
 YELLOW=$'\e[38;2;229;192;123m'
 RED=$'\e[38;2;224;108;117m'
@@ -50,29 +50,26 @@ progress_bar() {
   printf '%s' "$bar"
 }
 
-# ---------- Parse stdin ----------
-model_name=$(echo "$input" | jq -r '.model.display_name // "Unknown"')
-used_pct=$(echo "$input" | jq -r '.context_window.used_percentage // 0')
-cwd=$(echo "$input" | jq -r '.cwd // ""')
+# ---------- Parse stdin (single jq call) ----------
+eval "$(echo "$input" | jq -r '
+  "model_name=" + (.model.display_name // "Unknown" | @sh),
+  "used_pct=" + (.context_window.used_percentage // 0 | tostring),
+  "cwd=" + (.cwd // "" | @sh),
+  "lines_added=" + (.cost.total_lines_added // 0 | tostring),
+  "lines_removed=" + (.cost.total_lines_removed // 0 | tostring),
+  "cc_version=" + (.version // "0.0.0" | @sh)
+' 2>/dev/null)"
 
 # ---------- Git branch ----------
 git_branch=""
 if [ -n "$cwd" ] && [ -d "$cwd" ]; then
   git_branch=$(git -C "$cwd" --no-optional-locks rev-parse --abbrev-ref HEAD 2>/dev/null || true)
 fi
-[ -z "$git_branch" ] && git_branch=$(git --no-optional-locks rev-parse --abbrev-ref HEAD 2>/dev/null || true)
 
-# ---------- Git diff stats (+added/-removed) ----------
+# ---------- Line stats from stdin ----------
 git_stats=""
-if [ -n "$cwd" ] && [ -d "$cwd" ]; then
-  diff_stat=$(git -C "$cwd" --no-optional-locks diff --numstat HEAD 2>/dev/null || true)
-  if [ -n "$diff_stat" ]; then
-    added=$(echo "$diff_stat" | awk '{sum+=$1} END{print sum+0}')
-    removed=$(echo "$diff_stat" | awk '{sum+=$2} END{print sum+0}')
-    if [ "$added" -gt 0 ] || [ "$removed" -gt 0 ]; then
-      git_stats="+${added}/-${removed}"
-    fi
-  fi
+if [ "$lines_added" -gt 0 ] 2>/dev/null || [ "$lines_removed" -gt 0 ] 2>/dev/null; then
+  git_stats="+${lines_added}/-${lines_removed}"
 fi
 
 # ---------- Usage API (cached 360s) ----------
@@ -90,7 +87,7 @@ fetch_usage() {
 
   local access_token
   if echo "$token" | jq -e . >/dev/null 2>&1; then
-    access_token=$(echo "$token" | jq -r '.access_token // .claudeAiOauth.accessToken // empty' 2>/dev/null)
+    access_token=$(echo "$token" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
   else
     access_token="$token"
   fi
@@ -99,7 +96,8 @@ fetch_usage() {
   local response http_code
   response=$(curl -s --max-time 5 -w '\n%{http_code}' \
     -H "Authorization: Bearer ${access_token}" \
-    -H "anthropic-version: 2023-06-01" \
+    -H "Content-Type: application/json" \
+    -H "User-Agent: claude-code/${cc_version:-0.0.0}" \
     "https://api.anthropic.com/api/oauth/usage" 2>/dev/null || true)
   [ -z "$response" ] && return 1
 
@@ -107,7 +105,6 @@ fetch_usage() {
   local body
   body=$(echo "$response" | sed '$d')
 
-  # Only cache successful responses with valid JSON
   if [ "$http_code" = "200" ] && echo "$body" | jq -e . >/dev/null 2>&1; then
     echo "$body" > "$CACHE_FILE"
     return 0
@@ -117,10 +114,12 @@ fetch_usage() {
 
 load_usage() {
   local data="$1"
-  FIVE_HOUR_PCT=$(echo "$data" | jq -r '.five_hour.utilization // empty' 2>/dev/null || true)
-  FIVE_HOUR_RESET=$(echo "$data" | jq -r '.five_hour.reset_at // empty' 2>/dev/null || true)
-  SEVEN_DAY_PCT=$(echo "$data" | jq -r '.seven_day.utilization // empty' 2>/dev/null || true)
-  SEVEN_DAY_RESET=$(echo "$data" | jq -r '.seven_day.reset_at // empty' 2>/dev/null || true)
+  eval "$(echo "$data" | jq -r '
+    "FIVE_HOUR_PCT=" + (.five_hour.utilization // empty | tostring),
+    "FIVE_HOUR_RESET=" + (.five_hour.reset_at // empty | @sh),
+    "SEVEN_DAY_PCT=" + (.seven_day.utilization // empty | tostring),
+    "SEVEN_DAY_RESET=" + (.seven_day.reset_at // empty | @sh)
+  ' 2>/dev/null)"
 }
 
 # Check cache validity
@@ -138,7 +137,6 @@ else
   if fetch_usage; then
     load_usage "$(cat "$CACHE_FILE")"
   elif [ -f "$CACHE_FILE" ]; then
-    # API failed — fall back to stale cache
     load_usage "$(cat "$CACHE_FILE")"
   fi
 fi
@@ -150,7 +148,7 @@ to_pct() {
     echo ""
     return
   fi
-  awk "BEGIN{printf \"%.1f\", $val * 100}" 2>/dev/null || echo ""
+  awk "BEGIN{printf \"%.0f\", $val * 100}" 2>/dev/null || echo ""
 }
 
 FIVE_HOUR_PCT_DISPLAY=$(to_pct "$FIVE_HOUR_PCT")
@@ -161,7 +159,6 @@ format_reset_time() {
   local iso="$1"
   local format="$2"
   [ -z "$iso" ] && echo "N/A" && return
-  # Strip trailing Z and fractional seconds, parse as UTC
   local stripped="${iso%%Z*}"
   stripped="${stripped%%+*}"
   stripped="${stripped%%.*}"
@@ -169,11 +166,9 @@ format_reset_time() {
   epoch=$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%S" "$stripped" "+%s" 2>/dev/null || \
           date -d "${iso}" "+%s" 2>/dev/null || echo "")
   [ -z "$epoch" ] && echo "N/A" && return
-  # Convert to lowercase am/pm
   local result
   result=$(TZ="Asia/Tokyo" date -j -f "%s" "$epoch" "$format" 2>/dev/null || \
            TZ="Asia/Tokyo" date -d "@${epoch}" "$format" 2>/dev/null || echo "N/A")
-  # macOS %p gives uppercase AM/PM; convert to lowercase
   echo "$result" | sed 's/AM/am/;s/PM/pm/'
 }
 
@@ -195,50 +190,40 @@ fi
 
 # ---------- Line 1 ----------
 SEP="${GRAY} │ ${RESET}"
-
 ctx_color=$(color_for_pct "$ctx_pct_int")
 
-line1=""
-line1+="🤖 ${model_name}"
-line1+="${SEP}"
-line1+="${ctx_color}📊 ${ctx_pct_int}%${RESET}"
+line1="🤖 ${model_name}${SEP}${ctx_color}📊 ${ctx_pct_int}%${RESET}"
 
 if [ -n "$git_stats" ]; then
-  line1+="${SEP}"
-  line1+="✏️  ${GREEN}${git_stats}${RESET}"
+  line1+="${SEP}✏️  ${GREEN}${git_stats}${RESET}"
 fi
 
 if [ -n "$git_branch" ]; then
-  line1+="${SEP}"
-  line1+="🔀 ${git_branch}"
+  line1+="${SEP}🔀 ${git_branch}"
 fi
 
 # ---------- Line 2 (5h) ----------
 line2=""
 if [ -n "$FIVE_HOUR_PCT_DISPLAY" ]; then
-  pct_int_5h=$(printf "%.0f" "$FIVE_HOUR_PCT_DISPLAY" 2>/dev/null || echo 0)
+  pct_int_5h=$FIVE_HOUR_PCT_DISPLAY
   c5=$(color_for_pct "$pct_int_5h")
   bar5=$(progress_bar "$pct_int_5h")
   line2="${c5}⏱ 5h  ${bar5}  ${pct_int_5h}%${RESET}"
-  if [ -n "$five_reset_display" ]; then
-    line2+="  ${DIM}${five_reset_display}${RESET}"
-  fi
+  [ -n "$five_reset_display" ] && line2+="  ${DIM}${five_reset_display}${RESET}"
 else
-  line2="${GRAY}⏱ 5h  N/A${RESET}"
+  line2="${GRAY}⏱ 5h  ▱▱▱▱▱▱▱▱▱▱  --%${RESET}"
 fi
 
 # ---------- Line 3 (7d) ----------
 line3=""
 if [ -n "$SEVEN_DAY_PCT_DISPLAY" ]; then
-  pct_int_7d=$(printf "%.0f" "$SEVEN_DAY_PCT_DISPLAY" 2>/dev/null || echo 0)
+  pct_int_7d=$SEVEN_DAY_PCT_DISPLAY
   c7=$(color_for_pct "$pct_int_7d")
   bar7=$(progress_bar "$pct_int_7d")
   line3="${c7}📅 7d  ${bar7}  ${pct_int_7d}%${RESET}"
-  if [ -n "$seven_reset_display" ]; then
-    line3+="  ${DIM}${seven_reset_display}${RESET}"
-  fi
+  [ -n "$seven_reset_display" ] && line3+="  ${DIM}${seven_reset_display}${RESET}"
 else
-  line3="${GRAY}📅 7d  N/A${RESET}"
+  line3="${GRAY}📅 7d  ▱▱▱▱▱▱▱▱▱▱  --%${RESET}"
 fi
 
 # ---------- Output ----------
