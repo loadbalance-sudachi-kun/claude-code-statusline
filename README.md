@@ -195,8 +195,3 @@ GRAY=$'\e[38;2;74;88;92m'       # RGB(74, 88, 92)
 ## License
 
 MIT
-
-## Author
-
-**齊藤愼仁 ([@suthio](https://zenn.dev/suthio))**
-株式会社クラウドネイティブ 代表取締役社長
